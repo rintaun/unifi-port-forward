@@ -15,6 +15,7 @@ import (
 
 	"github.com/go-logr/logr"
 	"github.com/spf13/cobra"
+	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 	"sigs.k8s.io/yaml"
 	"unifi-port-forward/cmd/cleaner"
 	"unifi-port-forward/pkg/api/v1alpha1"
@@ -148,6 +149,9 @@ func runController(cmd *cobra.Command, args []string) error {
 	if err := v1alpha1.AddToScheme(mgr.GetScheme()); err != nil {
 		return fmt.Errorf("failed to add v1alpha1 to scheme: %w", err)
 	}
+	if err := gatewayv1.Install(mgr.GetScheme()); err != nil {
+		return fmt.Errorf("failed to add gateway/v1 to scheme: %w", err)
+	}
 
 	portforwardReconciler := &controller.PortForwardReconciler{
 		Client: mgr.GetClient(),
@@ -182,6 +186,19 @@ func runController(cmd *cobra.Command, args []string) error {
 	} else {
 		logger.Info("PortForwardRule CRD not found, PortForwardRule controller disabled (annotation-based mode only)")
 	}
+
+	gatewayReconciler := &controller.GatewayReconciler{
+		Client:   mgr.GetClient(),
+		Scheme:   mgr.GetScheme(),
+		Router:   router,
+		Config:   &cfg,
+		Recorder: mgr.GetEventRecorderFor("gateway-controller"),
+	}
+
+	if err := gatewayReconciler.SetupWithManager(mgr); err != nil {
+		return fmt.Errorf("failed to setup Gateway controller: %w", err)
+	}
+	logger.Info("Gateway controller enabled")
 
 	portforwardReconciler.PeriodicReconciler = controller.NewPeriodicReconciler(
 		mgr.GetClient(),

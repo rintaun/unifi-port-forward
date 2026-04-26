@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -12,16 +13,22 @@ import (
 	"unifi-port-forward/pkg/routers"
 
 	corev1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/api/errors"
+	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/validation/field"
 	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
 	ctrllog "sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 )
+
+// errServiceNotFound is returned when a serviceRef points to a service that does not exist.
+var errServiceNotFound = errors.New("referenced service not found")
 
 // PortForwardRuleReconciler reconciles PortForwardRule resources
 type PortForwardRuleReconciler struct {
@@ -49,7 +56,7 @@ func (r *PortForwardRuleReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 
 	rule := &v1alpha1.PortForwardRule{}
 	if err := r.Get(ctx, req.NamespacedName, rule); err != nil {
-		if errors.IsNotFound(err) {
+		if k8serrors.IsNotFound(err) {
 			// PortForwardRule deleted - clean up port forwards
 			return r.handleRuleDeletion(ctx, req.NamespacedName)
 		}
@@ -72,30 +79,41 @@ func (r *PortForwardRuleReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 
 	if err := r.validateRule(ctx, rule); err != nil {
 		logger.Error(err, "Rule validation failed")
-		r.updateRuleStatusWithRetry(ctx, rule, v1alpha1.PhaseFailed, err.Error())
+		r.updateRuleStatusWithRetry(ctx, rule, v1alpha1.PhaseFailed, "ValidationFailed", err.Error())
 		return ctrl.Result{}, err
 	}
 
 	if err := r.reconcilePortForwardRule(ctx, rule); err != nil {
+		// Service referenced by serviceRef does not exist yet — mark unhealthy and wait.
+		// The Service watch will trigger re-reconciliation when the service appears.
+		if errors.Is(err, errServiceNotFound) {
+			msg := err.Error()
+			logger.Info("Referenced service not found, marking rule as failed",
+				"rule", rule.Name,
+				"namespace", rule.Namespace,
+				"error", msg)
+			r.Recorder.Event(rule, corev1.EventTypeWarning, "ServiceNotFound", msg)
+			r.updateRuleStatusWithRetry(ctx, rule, v1alpha1.PhaseFailed, "ServiceNotFound", msg)
+			return ctrl.Result{RequeueAfter: time.Minute * 5}, nil
+		}
 		// Check for special overlap error that needs backoff
 		if err.Error() == "PortForwardOverlaps: requires backoff" {
 			logger.Info("Port forward overlap detected, applying exponential backoff",
 				"rule", rule.Name,
 				"namespace", rule.Namespace)
-			r.updateRuleStatusWithRetry(ctx, rule, v1alpha1.PhaseFailed, "Port forward overlap conflict")
+			r.updateRuleStatusWithRetry(ctx, rule, v1alpha1.PhaseFailed, "PortConflict", "Port forward overlap conflict")
 			return ctrl.Result{RequeueAfter: time.Minute * 5}, nil
-		} else {
-			// For any other error, apply a shorter backoff to prevent spam
-			logger.Info("Port forward reconciliation failed, applying backoff",
-				"rule", rule.Name,
-				"namespace", rule.Namespace,
-				"error", err.Error())
-			r.updateRuleStatusWithRetry(ctx, rule, v1alpha1.PhaseFailed, err.Error())
-			return ctrl.Result{RequeueAfter: time.Minute * 1}, nil
 		}
+		// For any other error, apply a shorter backoff to prevent spam
+		logger.Info("Port forward reconciliation failed, applying backoff",
+			"rule", rule.Name,
+			"namespace", rule.Namespace,
+			"error", err.Error())
+		r.updateRuleStatusWithRetry(ctx, rule, v1alpha1.PhaseFailed, "ReconciliationFailed", err.Error())
+		return ctrl.Result{RequeueAfter: time.Minute * 1}, nil
 	}
 
-	r.updateRuleStatusWithRetry(ctx, rule, v1alpha1.PhaseActive, "")
+	r.updateRuleStatusWithRetry(ctx, rule, v1alpha1.PhaseActive, "", "")
 
 	logger.V(1).Info("Successfully reconciled PortForwardRule")
 	return ctrl.Result{RequeueAfter: time.Minute * 5}, nil
@@ -105,12 +123,6 @@ func (r *PortForwardRuleReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 func (r *PortForwardRuleReconciler) validateRule(ctx context.Context, rule *v1alpha1.PortForwardRule) error {
 	if err := rule.ValidateCreate(); len(err) > 0 {
 		return fmt.Errorf("validation failed: %v", err)
-	}
-
-	if rule.Spec.ServiceRef != nil {
-		if validationErrs := rule.ValidateServiceExists(ctx, r.Client); len(validationErrs) > 0 {
-			return fmt.Errorf("service validation failed: %v", validationErrs)
-		}
 	}
 
 	if conflictErrs := rule.ValidateCrossNamespacePortConflict(ctx, r.Client); len(conflictErrs) > 0 {
@@ -277,6 +289,9 @@ func (r *PortForwardRuleReconciler) getServiceDestination(ctx context.Context, r
 
 	var service corev1.Service
 	if err := r.Get(ctx, client.ObjectKey{Name: rule.Spec.ServiceRef.Name, Namespace: namespace}, &service); err != nil {
+		if k8serrors.IsNotFound(err) {
+			return "", 0, fmt.Errorf("%w: service %s/%s", errServiceNotFound, namespace, rule.Spec.ServiceRef.Name)
+		}
 		return "", 0, fmt.Errorf("failed to get service: %w", err)
 	}
 
@@ -310,8 +325,10 @@ func (r *PortForwardRuleReconciler) getServiceDestination(ctx context.Context, r
 	return destIP, destPort, nil
 }
 
-// updateRuleStatusWithRetry updates status of PortForwardRule with retry logic for conflicts
-func (r *PortForwardRuleReconciler) updateRuleStatusWithRetry(ctx context.Context, rule *v1alpha1.PortForwardRule, phase, errorMsg string) {
+// updateRuleStatusWithRetry updates status of PortForwardRule with retry logic for conflicts.
+// reason is the CamelCase condition reason (e.g. "ServiceNotFound", "ReconciliationFailed").
+// Pass an empty string to use the default reason for the phase.
+func (r *PortForwardRuleReconciler) updateRuleStatusWithRetry(ctx context.Context, rule *v1alpha1.PortForwardRule, phase, reason, errorMsg string) {
 	logger := ctrllog.FromContext(ctx)
 
 	// Use the existing updateRuleStatus logic but with retry
@@ -344,12 +361,15 @@ func (r *PortForwardRuleReconciler) updateRuleStatusWithRetry(ctx context.Contex
 
 		conditionType := "RuleReady"
 		status := metav1.ConditionFalse
-		reason := "Failed"
+		condReason := reason
+		if condReason == "" {
+			condReason = "Failed"
+		}
 		message := errorMsg
 
 		if phase == v1alpha1.PhaseActive {
 			status = metav1.ConditionTrue
-			reason = "RuleApplied"
+			condReason = "RuleApplied"
 			message = "Port forwarding rule successfully applied"
 		}
 
@@ -362,7 +382,7 @@ func (r *PortForwardRuleReconciler) updateRuleStatusWithRetry(ctx context.Contex
 		for i, condition := range updatedConditions {
 			if condition.Type == conditionType {
 				updatedConditions[i].Status = status
-				updatedConditions[i].Reason = reason
+				updatedConditions[i].Reason = condReason
 				updatedConditions[i].Message = message
 				updatedConditions[i].LastTransitionTime = metav1.Now()
 				conditionFound = true
@@ -375,7 +395,7 @@ func (r *PortForwardRuleReconciler) updateRuleStatusWithRetry(ctx context.Contex
 				Type:               conditionType,
 				Status:             status,
 				LastTransitionTime: metav1.Now(),
-				Reason:             reason,
+				Reason:             condReason,
 				Message:            message,
 			})
 		}
@@ -409,7 +429,7 @@ func (r *PortForwardRuleReconciler) updateRuleStatusWithRetry(ctx context.Contex
 			return // Success
 		}
 
-		if errors.IsConflict(err) {
+		if k8serrors.IsConflict(err) {
 			logger.Info("Status update conflict detected, will retry",
 				"attempt", attempt+1,
 				"error", err.Error(),
@@ -487,7 +507,7 @@ func (r *PortForwardRuleReconciler) handleRuleDeletion(ctx context.Context, name
 			logger.Error(updErr, "Failed to remove finalizer")
 			return ctrl.Result{}, updErr
 		}
-	} else if errors.IsNotFound(err) {
+	} else if k8serrors.IsNotFound(err) {
 		// Rule is already deleted from K8s - this can happen if deletion was already processed
 		logger.V(1).Info("PortForwardRule not found during deletion handling, likely already processed")
 	} else {
@@ -500,10 +520,48 @@ func (r *PortForwardRuleReconciler) handleRuleDeletion(ctx context.Context, name
 	return ctrl.Result{}, nil
 }
 
+// findRulesForService returns reconcile requests for every PortForwardRule that
+// references the given Service via spec.serviceRef, so that rules are
+// immediately re-reconciled when their referenced service appears or changes.
+func (r *PortForwardRuleReconciler) findRulesForService(ctx context.Context, obj client.Object) []reconcile.Request {
+	svc, ok := obj.(*corev1.Service)
+	if !ok {
+		return nil
+	}
+
+	var ruleList v1alpha1.PortForwardRuleList
+	if err := r.List(ctx, &ruleList); err != nil {
+		return nil
+	}
+
+	var requests []reconcile.Request
+	for _, rule := range ruleList.Items {
+		if rule.Spec.ServiceRef == nil {
+			continue
+		}
+		namespace := rule.Namespace
+		if rule.Spec.ServiceRef.Namespace != nil {
+			namespace = *rule.Spec.ServiceRef.Namespace
+		}
+		if rule.Spec.ServiceRef.Name == svc.Name && namespace == svc.Namespace {
+			requests = append(requests, reconcile.Request{
+				NamespacedName: types.NamespacedName{
+					Name:      rule.Name,
+					Namespace: rule.Namespace,
+				},
+			})
+		}
+	}
+	return requests
+}
+
 // SetupWithManager sets up the controller with the Manager
 func (r *PortForwardRuleReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&v1alpha1.PortForwardRule{}).
-		Owns(&corev1.Service{}). // Watch services that are referenced by rules
+		Watches(
+			&corev1.Service{},
+			handler.EnqueueRequestsFromMapFunc(r.findRulesForService),
+		).
 		Complete(r)
 }

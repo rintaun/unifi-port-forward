@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -116,6 +117,50 @@ func TestPortForwardRuleDeletion_SimpleTest(t *testing.T) {
 	}
 
 	t.Log("✅ PortForwardRule deletion test passed!")
+}
+
+// TestPortForwardRule_ServiceNotFound verifies that getServiceDestination wraps a
+// missing-service error as errServiceNotFound so the reconciler can distinguish it
+// from transient API errors and mark the rule as unhealthy without requeuing loudly.
+func TestPortForwardRule_ServiceNotFound(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatalf("Failed to add core v1 to scheme: %v", err)
+	}
+	if err := v1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatalf("Failed to add v1alpha1 to scheme: %v", err)
+	}
+
+	// Fake client with no services registered — any Service Get will return NotFound.
+	fakeClient := testutils.NewFakeKubernetesClient(t, scheme)
+
+	ctrl := &PortForwardRuleReconciler{
+		Client:   fakeClient,
+		Router:   testutils.NewMockRouter(),
+		Scheme:   scheme,
+		Config:   &config.Config{Debug: true},
+		Recorder: &record.FakeRecorder{},
+	}
+
+	svcName := "my-missing-svc"
+	rule := &v1alpha1.PortForwardRule{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-rule", Namespace: "default"},
+		Spec: v1alpha1.PortForwardRuleSpec{
+			ExternalPort: 8080,
+			Protocol:     "tcp",
+			Interface:    "wan",
+			Enabled:      true,
+			ServiceRef:   &v1alpha1.ServiceReference{Name: svcName, Port: "http"},
+		},
+	}
+
+	_, _, err := ctrl.getServiceDestination(context.Background(), rule)
+	if err == nil {
+		t.Fatal("expected an error for missing service, got nil")
+	}
+	if !errors.Is(err, errServiceNotFound) {
+		t.Fatalf("expected errServiceNotFound, got: %v", err)
+	}
 }
 
 // Helper functions for creating pointers to primitives

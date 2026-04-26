@@ -9,7 +9,7 @@ permissions:
   packages: write
 
 env:
-  REGISTRY: ghcr.io/fiskhest/unifi-port-forward
+  REGISTRY: ghcr.io/rintaun/unifi-port-forward
 
 jobs:
   build-and-push:
